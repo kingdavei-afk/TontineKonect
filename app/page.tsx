@@ -1,69 +1,77 @@
-import Image from "next/image";
+import Link from "next/link";
+import { redirect } from "next/navigation";
+import { getUser } from "@/lib/auth";
 
-export default function Home() {
+export default async function Home() {
+  const user = await getUser();
+  if (user) redirect("/tontines");
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="space-y-14">
+      <section className="overflow-hidden rounded-3xl bg-gradient-to-br from-orange-600 via-orange-500 to-amber-500 px-6 py-14 text-white sm:px-12 sm:py-20">
+        <p className="mb-3 text-sm font-semibold uppercase tracking-widest text-orange-100">
+          Abidjan · Côte d&apos;Ivoire
+        </p>
+        <h1 className="max-w-2xl text-4xl font-extrabold leading-tight sm:text-5xl">
+          Votre tontine, enfin bien organisée.
+        </h1>
+        <p className="mt-4 max-w-xl text-lg text-orange-50">
+          Créez votre tontine, invitez les membres par un code, suivez qui a payé, qui doit, et à qui revient
+          le pot à chaque tour. Fini les groupes WhatsApp et les cahiers perdus.
+        </p>
+        <div className="mt-8 flex flex-wrap gap-3">
+          <Link
+            href="/register"
+            className="rounded-xl bg-white px-6 py-3 font-semibold text-orange-700 shadow-lg transition hover:bg-orange-50"
           >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            Créer ma tontine
+          </Link>
+          <Link
+            href="/login"
+            className="rounded-xl border border-white/70 px-6 py-3 font-semibold text-white transition hover:bg-white/10"
           >
-            Documentation
-          </a>
+            J&apos;ai déjà un compte
+          </Link>
         </div>
-      </main>
+      </section>
+
+      <section className="grid gap-5 sm:grid-cols-3">
+        {[
+          {
+            t: "Cotisations suivies",
+            d: "Le trésorier déclare chaque paiement (Wave, Orange Money, MTN, Moov ou espèces) et tout le monde voit l'état en temps réel.",
+          },
+          {
+            t: "Ordre des tours clair",
+            d: "Chaque membre a son tour de bénéficiaire, avec la date d'échéance et le montant exact du pot.",
+          },
+          {
+            t: "Rappels WhatsApp",
+            d: "Un clic pour envoyer un rappel poli aux retardataires, directement dans WhatsApp.",
+          },
+        ].map((f) => (
+          <div key={f.t} className="rounded-2xl border border-stone-200 bg-white p-6 shadow-sm">
+            <h2 className="text-lg font-bold text-stone-900">{f.t}</h2>
+            <p className="mt-2 text-sm leading-relaxed text-stone-600">{f.d}</p>
+          </div>
+        ))}
+      </section>
+
+      <section className="rounded-2xl border border-stone-200 bg-white p-6 sm:p-8">
+        <h2 className="text-xl font-bold text-stone-900">Comment ça marche</h2>
+        <ol className="mt-5 grid gap-5 sm:grid-cols-3">
+          {[
+            ["1. Créez votre compte", "Votre numéro de téléphone + un code secret. Pas d'email requis."],
+            ["2. Créez la tontine", "Montant, fréquence, date de début : vous recevez un code d'invitation."],
+            ["3. Invitez et cotisez", "Les membres rejoignent avec le code, le trésorier enregistre chaque paiement."],
+          ].map(([t, d]) => (
+            <li key={t} className="rounded-xl bg-stone-50 p-4">
+              <p className="font-semibold text-orange-700">{t}</p>
+              <p className="mt-1 text-sm text-stone-600">{d}</p>
+            </li>
+          ))}
+        </ol>
+      </section>
     </div>
   );
 }
