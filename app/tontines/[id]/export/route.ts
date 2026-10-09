@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import type { NextRequest } from "next/server";
-import { db } from "@/lib/db";
+import { get } from "@/lib/db";
 import { getUser } from "@/lib/auth";
 import {
   AUDIT_LABELS,
@@ -28,11 +28,12 @@ export async function GET(
   const user = await getUser();
   if (!user) redirect("/login");
 
-  const t = getTontine(id);
+  const t = await getTontine(id);
   if (!t) redirect("/tontines");
-  const member = db
-    .prepare("SELECT 1 AS x FROM memberships WHERE tontine_id = ? AND user_id = ?")
-    .get(t.id, user.id);
+  const member = await get("SELECT 1 AS x FROM memberships WHERE tontine_id = ? AND user_id = ?", [
+    t.id,
+    user.id,
+  ]);
   if (!member) redirect(`/tontines/${t.id}`);
 
   const type = request.nextUrl.searchParams.get("type");
@@ -41,7 +42,7 @@ export async function GET(
 
   if (type === "cotisations") {
     const today = todayISO();
-    const rows = getAllContributions(t.id).map((c) => [
+    const rows = (await getAllContributions(t.id)).map((c) => [
       c.idx,
       frDate(c.due_date),
       c.beneficiary ?? "",
@@ -76,7 +77,7 @@ export async function GET(
     );
     label = "cotisations";
   } else if (type === "audit") {
-    const rows = getAuditLogs(t.id, 100000).map((a) => [
+    const rows = (await getAuditLogs(t.id, 100000)).map((a) => [
       frDateTime(a.created_at),
       AUDIT_LABELS[a.action as AuditAction] ?? a.action,
       a.target ?? "",
@@ -92,7 +93,7 @@ export async function GET(
     );
     label = "journal-audit";
   } else if (type === "membres") {
-    const rows = getMemberStats(t.id).map((m) => [
+    const rows = (await getMemberStats(t.id)).map((m) => [
       m.position,
       m.name,
       m.phone,
@@ -119,7 +120,7 @@ export async function GET(
     );
     label = "membres";
   } else if (type === "remboursements") {
-    const rows = getRefunds(t.id).map((r) => [
+    const rows = (await getRefunds(t.id)).map((r) => [
       r.member.name,
       r.member.phone,
       frDate(r.created_at),

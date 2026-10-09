@@ -1,6 +1,6 @@
 import { cookies } from "next/headers";
 import crypto from "node:crypto";
-import { db, type UserRow } from "./db";
+import { get, run, sqlNow, sqlNowPlusDays, type UserRow } from "./db";
 
 const SESSION_DAYS = 30;
 const COOKIE = "tk_sid";
@@ -51,22 +51,22 @@ export async function getUser(): Promise<SessionUser | null> {
   const store = await cookies();
   const sid = store.get(COOKIE)?.value;
   if (!sid) return null;
-  const row = db
-    .prepare(
-      `SELECT u.id, u.phone, u.name
-       FROM sessions s JOIN users u ON u.id = s.user_id
-       WHERE s.id = ? AND s.expires_at > datetime('now')`
-    )
-    .get(sid) as SessionUser | undefined;
+  const row = await get<SessionUser>(
+    `SELECT u.id, u.phone, u.name
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.id = $1 AND s.expires_at > $2`,
+    [sid, sqlNow()]
+  );
   return row ?? null;
 }
 
 export async function createUserSession(userId: string): Promise<void> {
   const sid = crypto.randomBytes(32).toString("hex");
-  db.prepare(
-    `INSERT INTO sessions (id, user_id, expires_at)
-     VALUES (?, ?, datetime('now', '+' || ? || ' days'))`
-  ).run(sid, userId, SESSION_DAYS);
+  await run(`INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)`, [
+    sid,
+    userId,
+    sqlNowPlusDays(SESSION_DAYS),
+  ]);
   const store = await cookies();
   store.set(COOKIE, sid, {
     httpOnly: true,
@@ -79,10 +79,10 @@ export async function createUserSession(userId: string): Promise<void> {
 export async function destroyUserSession(): Promise<void> {
   const store = await cookies();
   const sid = store.get(COOKIE)?.value;
-  if (sid) db.prepare("DELETE FROM sessions WHERE id = ?").run(sid);
+  if (sid) await run("DELETE FROM sessions WHERE id = $1", [sid]);
   store.delete(COOKIE);
 }
 
-export function findUserByPhone(phone: string): UserRow | undefined {
-  return db.prepare("SELECT * FROM users WHERE phone = ?").get(phone) as UserRow | undefined;
+export async function findUserByPhone(phone: string): Promise<UserRow | undefined> {
+  return get<UserRow>("SELECT * FROM users WHERE phone = $1", [phone]);
 }

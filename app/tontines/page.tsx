@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { db } from "@/lib/db";
+import { all, get, type CycleRow } from "@/lib/db";
 import { getUser } from "@/lib/auth";
 import {
   currentCycle,
@@ -35,54 +35,58 @@ export default async function TontinesPage({
   if (!user) redirect("/login");
   const { code } = await searchParams;
 
-  const rows = db
-    .prepare(
-      `SELECT t.id, m.id AS membership_id, m.status AS membership_status
-       FROM memberships m JOIN tontines t ON t.id = m.tontine_id
-       WHERE m.user_id = ? ORDER BY t.created_at DESC`
-    )
-    .all(user.id) as { id: string; membership_id: string; membership_status: string }[];
+  const rows = await all<{
+    id: string;
+    membership_id: string;
+    membership_status: string;
+  }>(
+    `SELECT t.id, m.id AS membership_id, m.status AS membership_status
+     FROM memberships m JOIN tontines t ON t.id = m.tontine_id
+     WHERE m.user_id = ? ORDER BY t.created_at DESC`,
+    [user.id]
+  );
 
-  const cards = rows.flatMap((r) => {
-    const t = getTontine(r.id);
-    if (!t) return [];
+  const cards: { item: BoardItem }[] = [];
+  for (const r of rows ?? []) {
+    const t = await getTontine(r.id);
+    if (!t) continue;
     const isOpen = t.status === "actif";
-    const cycles = isOpen ? ensureCycles(t) : getCycles(t.id);
+    const cycles: CycleRow[] = isOpen ? await ensureCycles(t) : await getCycles(t.id);
     const cur = currentCycle(cycles);
-    const members = db
-      .prepare("SELECT COUNT(*) AS n FROM memberships WHERE tontine_id = ?")
-      .get(t.id) as { n: number };
+    const members = await get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM memberships WHERE tontine_id = ?",
+      [t.id]
+    );
     let myStatus: "paid" | "due" | "late" | "beneficiary" | "done" | "closed" | "parti" = "done";
     if (!isOpen) myStatus = "closed";
     else if (r.membership_status === "parti") myStatus = "parti";
     else if (cur) {
-      const iPaid = db
-        .prepare("SELECT 1 FROM contributions WHERE cycle_id = ? AND membership_id = ?")
-        .get(cur.id, r.membership_id);
+      const iPaid = await get("SELECT 1 FROM contributions WHERE cycle_id = ? AND membership_id = ?", [
+        cur.id,
+        r.membership_id,
+      ]);
       if (cur.beneficiary_id === r.membership_id) myStatus = "beneficiary";
       else if (iPaid) myStatus = "paid";
       else if (cur.due_date < todayISO()) myStatus = "late";
       else myStatus = "due";
     }
-    return [
-      {
-        item: {
-          id: t.id,
-          name: t.name,
-          sub: `${formatFcfa(t.amount)} / ${frequencyLabel(t.frequency).toLowerCase()} · ${members.n} membres`,
-          line: !isOpen
-            ? "Tontine clôturée — lecture seule"
-            : cur
-              ? `Tour n°${cur.idx} — échéance du ${formatDate(cur.due_date)}`
-              : "Tous les tours sont terminés 🎉",
-          badgeStatus: myStatus,
-          badgeLabel: STATUS_LABELS[myStatus] ?? myStatus,
-          late: isOpen && !!cur && isLate(cur),
-          isOpen,
-        } satisfies BoardItem,
-      },
-    ];
-  });
+    cards.push({
+      item: {
+        id: t.id,
+        name: t.name,
+        sub: `${formatFcfa(t.amount)} / ${frequencyLabel(t.frequency).toLowerCase()} · ${members?.n ?? 0} membres`,
+        line: !isOpen
+          ? "Tontine clôturée — lecture seule"
+          : cur
+            ? `Tour n°${cur.idx} — échéance du ${formatDate(cur.due_date)}`
+            : "Tous les tours sont terminés 🎉",
+        badgeStatus: myStatus,
+        badgeLabel: STATUS_LABELS[myStatus] ?? myStatus,
+        late: isOpen && !!cur && isLate(cur),
+        isOpen,
+      } satisfies BoardItem,
+    });
+  }
 
   return (
     <div className="space-y-8">

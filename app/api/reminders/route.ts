@@ -9,7 +9,11 @@ export const dynamic = "force-dynamic";
  */
 async function handle(req: Request): Promise<NextResponse> {
   const url = new URL(req.url);
-  const secret = url.searchParams.get("secret") ?? req.headers.get("x-cron-secret");
+  // Vercel Cron envoie `Authorization: Bearer <CRON_SECRET>` ; en local on
+  // accepte aussi ?secret= ou l'en-tête x-cron-secret.
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  const secret = bearer ?? url.searchParams.get("secret") ?? req.headers.get("x-cron-secret");
   const expected = process.env.CRON_SECRET ?? "local-dev";
   if (secret !== expected) {
     return NextResponse.json({ error: "non autorisé" }, { status: 401 });

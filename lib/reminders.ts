@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import webpush from "web-push";
-import { db, newId, type MembershipRow, type TontineRow } from "./db";
+import { all, get, newId, run, type MembershipRow, type TontineRow } from "./db";
 import {
   cycleAmount,
   currentCycle,
@@ -15,7 +15,9 @@ import {
 } from "./tontine";
 
 /* ------------------------------------------------------------------ */
-/* Clés VAPID (générées une fois, stockées dans data/vapid.json)        */
+/* Clés VAPID (env VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY en prod,       */
+/* sinon fichier data/vapid.json en local — écriture disque indispo-   */
+/* sible sur Vercel)                                                   */
 /* ------------------------------------------------------------------ */
 
 type VapidKeys = { publicKey: string; privateKey: string };
@@ -25,11 +27,15 @@ function vapidFile(): string {
 }
 
 export function getVapidKeys(): VapidKeys {
-  const file = vapidFile();
+  const publicKey = process.env.VAPID_PUBLIC_KEY;
+  const privateKey = process.env.VAPID_PRIVATE_KEY;
+  if (publicKey && privateKey) {
+    return { publicKey, privateKey };
+  }
   const cached = (globalThis as { __vapid?: VapidKeys }).__vapid;
   if (cached) return cached;
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as VapidKeys;
+    const parsed = JSON.parse(fs.readFileSync(vapidFile(), "utf8")) as VapidKeys;
     if (parsed.publicKey && parsed.privateKey) {
       (globalThis as { __vapid?: VapidKeys }).__vapid = parsed;
       return parsed;
@@ -38,8 +44,8 @@ export function getVapidKeys(): VapidKeys {
     /* première exécution */
   }
   const keys = webpush.generateVAPIDKeys();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(keys, null, 2), { mode: 0o600 });
+  fs.mkdirSync(path.dirname(vapidFile()), { recursive: true });
+  fs.writeFileSync(vapidFile(), JSON.stringify(keys, null, 2), { mode: 0o600 });
   (globalThis as { __vapid?: VapidKeys }).__vapid = keys;
   return keys;
 }
@@ -57,39 +63,44 @@ export type PushSubscriptionJson = {
   keys?: { p256dh?: string; auth?: string };
 };
 
-/** Enregistre (ou remet à jour) l'abonnement push d'un utilisateur. */
-export function saveSubscription(userId: string, sub: PushSubscriptionJson): boolean {
+/** Enregistre (ou met à jour) l'abonnement push d'un utilisateur. */
+export async function saveSubscription(
+  userId: string,
+  sub: PushSubscriptionJson
+): Promise<boolean> {
   const endpoint = sub.endpoint;
   const p256dh = sub.keys?.p256dh;
   const auth = sub.keys?.auth;
   if (!endpoint || !p256dh || !auth) return false;
-  db.prepare(
+  await run(
     `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth)
-     VALUES (?, ?, ?, ?, ?)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id,
                                          p256dh = excluded.p256dh,
-                                         auth = excluded.auth`
-  ).run(newId(), userId, endpoint, p256dh, auth);
+                                         auth = excluded.auth`,
+    [newId(), userId, endpoint, p256dh, auth]
+  );
   return true;
 }
 
-export function removeSubscription(userId: string, endpoint: string): void {
-  db.prepare("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?").run(
+export async function removeSubscription(userId: string, endpoint: string): Promise<void> {
+  await run("DELETE FROM push_subscriptions WHERE user_id = $1 AND endpoint = $2", [
     userId,
-    endpoint
+    endpoint,
+  ]);
+}
+
+export async function subscriptionCount(userId: string): Promise<number> {
+  const row = await get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM push_subscriptions WHERE user_id = $1",
+    [userId]
   );
+  return row?.n ?? 0;
 }
 
-export function subscriptionCount(userId: string): number {
-  const row = db
-    .prepare("SELECT COUNT(*) AS n FROM push_subscriptions WHERE user_id = ?")
-    .get(userId) as { n: number };
-  return row.n;
-}
-
-export function hasSubscription(userId: string | null): boolean {
+export async function hasSubscription(userId: string | null): Promise<boolean> {
   if (!userId) return false;
-  return subscriptionCount(userId) > 0;
+  return (await subscriptionCount(userId)) > 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -102,9 +113,10 @@ async function sendToUser(
   userId: string,
   payload: PushPayload
 ): Promise<{ sent: number; subs: number; error?: string }> {
-  const subs = db
-    .prepare("SELECT * FROM push_subscriptions WHERE user_id = ?")
-    .all(userId) as { id: string; endpoint: string; p256dh: string; auth: string }[];
+  const subs = await all<{ id: string; endpoint: string; p256dh: string; auth: string }>(
+    "SELECT * FROM push_subscriptions WHERE user_id = $1",
+    [userId]
+  );
   if (subs.length === 0) return { sent: 0, subs: 0 };
 
   const { publicKey, privateKey } = getVapidKeys();
@@ -132,7 +144,7 @@ async function sendToUser(
       lastError = `${s.endpoint} → ${message}`;
       if (status === 404 || status === 410) {
         // Abonnement expiré ou révoqué par le navigateur.
-        db.prepare("DELETE FROM push_subscriptions WHERE id = ?").run(s.id);
+        await run("DELETE FROM push_subscriptions WHERE id = $1", [s.id]);
       } else {
         console.error("[reminders] envoi push échoué:", message);
       }
@@ -207,33 +219,24 @@ export async function runReminders(today = todayISO()): Promise<ReminderReport> 
     errors: 0,
   };
 
-  const tontines = db
-    .prepare("SELECT * FROM tontines WHERE status = 'actif'")
-    .all() as TontineRow[];
-
-  const insertReminder = db.prepare(
-    `INSERT OR IGNORE INTO reminders (id, tontine_id, cycle_id, membership_id, kind, stage)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  );
+  const tontines = await all<TontineRow>("SELECT * FROM tontines WHERE status = 'actif'");
 
   for (const t of tontines) {
     report.scanned++;
-    const members = getMembers(t.id);
+    const members = await getMembers(t.id);
     if (members.length === 0) continue;
-    const cycles = ensureCycles(t);
+    const cycles = await ensureCycles(t);
     const cur = currentCycle(cycles);
     if (!cur) continue;
 
     const stage = stageFor(daysBetween(today, cur.due_date));
     if (!stage) continue;
 
-    const paidIds = new Set(
-      (
-        db
-          .prepare("SELECT membership_id FROM contributions WHERE cycle_id = ?")
-          .all(cur.id) as { membership_id: string }[]
-      ).map((r) => r.membership_id)
+    const paidRows = await all<{ membership_id: string }>(
+      "SELECT membership_id FROM contributions WHERE cycle_id = $1",
+      [cur.id]
     );
+    const paidIds = new Set(paidRows.map((r) => r.membership_id));
 
     const unpaid = expectedPayers(members, paidIds).filter((m) => !paidIds.has(m.id));
     if (unpaid.length === 0) continue;
@@ -273,15 +276,13 @@ export async function runReminders(today = todayISO()): Promise<ReminderReport> 
     }
 
     for (const job of jobs) {
-      const res = insertReminder.run(
-        newId(),
-        t.id,
-        cur.id,
-        job.member.id,
-        job.kind,
-        stage
+      const inserted = await run(
+        `INSERT INTO reminders (id, tontine_id, cycle_id, membership_id, kind, stage)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (cycle_id, membership_id, kind, stage) DO NOTHING`,
+        [newId(), t.id, cur.id, job.member.id, job.kind, stage]
       );
-      if (res.changes === 0) continue; // déjà envoyé pour cette étape
+      if (inserted === 0) continue; // déjà envoyé pour cette étape
       report.created++;
       try {
         if (!job.member.user_id) {
@@ -314,8 +315,13 @@ export async function runReminders(today = todayISO()): Promise<ReminderReport> 
 const INTERVAL_MS = 10 * 60 * 1000; // toutes les 10 minutes
 const FIRST_RUN_MS = 15 * 1000; // un peu après le démarrage du serveur
 
-/** Démarre la boucle de rappels (une seule fois par processus). */
+/**
+ * Démarre la boucle de rappels (une seule fois par processus).
+ * Sur Vercel, la boucle est inutile : c'est le cron (/api/reminders) qui
+ * déclenche runReminders, les instances serverless étant éphémères.
+ */
 export function startReminderScheduler(): void {
+  if (process.env.VERCEL) return;
   const g = globalThis as { __reminderTimer?: ReturnType<typeof setInterval> };
   if (g.__reminderTimer) return;
 
@@ -336,17 +342,18 @@ export function startReminderScheduler(): void {
 /* Aide serveur (affichage des statuts dans l'interface)               */
 /* ------------------------------------------------------------------ */
 
-export function pushStatusForTontine(tontineId: string): Record<string, boolean> {
-  const rows = db
-    .prepare(
-      `SELECT m.id AS membership_id, COUNT(p.id) AS subs
-       FROM memberships m
-       LEFT JOIN users u ON u.id = m.user_id
-       LEFT JOIN push_subscriptions p ON p.user_id = u.id
-       WHERE m.tontine_id = ?
-       GROUP BY m.id`
-    )
-    .all(tontineId) as { membership_id: string; subs: number }[];
+export async function pushStatusForTontine(
+  tontineId: string
+): Promise<Record<string, boolean>> {
+  const rows = await all<{ membership_id: string; subs: number }>(
+    `SELECT m.id AS membership_id, COUNT(p.id) AS subs
+     FROM memberships m
+     LEFT JOIN users u ON u.id = m.user_id
+     LEFT JOIN push_subscriptions p ON p.user_id = u.id
+     WHERE m.tontine_id = $1
+     GROUP BY m.id`,
+    [tontineId]
+  );
   const map: Record<string, boolean> = {};
   for (const r of rows) map[r.membership_id] = r.subs > 0;
   return map;

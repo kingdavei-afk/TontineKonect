@@ -1,6 +1,47 @@
-import Database from "better-sqlite3";
-import path from "node:path";
-import fs from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Pool, types, type PoolClient } from "pg";
+
+/* ------------------------------------------------------------------ */
+/* Configuration                                                       */
+/* ------------------------------------------------------------------ */
+
+// COUNT/SUM renvoient int8 (20) et numeric (1700) sous forme de chaînes par
+// défaut : nos compteurs et nos montants sont bien loin de 2^53, on convertit.
+types.setTypeParser(20, (v: string) => parseInt(v, 10));
+types.setTypeParser(1700, (v: string) => parseFloat(v));
+
+function createPool(): Pool {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) {
+    throw new Error(
+      "DATABASE_URL manquant : renseignez-le dans .env.local (local) ou dans les variables d'environnement Vercel."
+    );
+  }
+  // Neon ajoute channel_binding=require, que le driver pg ne supporte pas
+  // (SCRAM sans channel binding) : sslmode=require chiffre déjà la connexion.
+  const url = raw
+    .replace(/([?&])channel_binding=require&?/, "$1")
+    .replace(/[?&]$/, "")
+    .replace(/\?&/, "?");
+  return new Pool({
+    connectionString: url,
+    max: 10,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 15_000,
+  });
+}
+
+const g = globalThis as unknown as { __tontinePool?: Pool };
+export const pool = g.__tontinePool ?? (g.__tontinePool = createPool());
+
+/* ------------------------------------------------------------------ */
+/* Schéma                                                              */
+/* ------------------------------------------------------------------ */
+
+// Postgres : les dates restent en TEXT au format « AAAA-MM-JJ HH:MM:SS » UTC
+// (même format que SQLite datetime('now')) pour que les comparaisons de
+// chaînes et l'affichage français continuent de fonctionner à l'identique.
+const NOW = `to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -8,7 +49,7 @@ CREATE TABLE IF NOT EXISTS users (
   phone TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
   pin TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (${NOW})
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -26,7 +67,8 @@ CREATE TABLE IF NOT EXISTS tontines (
   creator_id TEXT NOT NULL REFERENCES users(id),
   invite_code TEXT UNIQUE NOT NULL,
   status TEXT NOT NULL DEFAULT 'actif',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (${NOW}),
+  closed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS memberships (
@@ -37,7 +79,9 @@ CREATE TABLE IF NOT EXISTS memberships (
   name TEXT NOT NULL,
   position INTEGER NOT NULL,
   is_treasurer INTEGER NOT NULL DEFAULT 0,
-  joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+  joined_at TEXT NOT NULL DEFAULT (${NOW}),
+  status TEXT NOT NULL DEFAULT 'actif',
+  left_at TEXT,
   UNIQUE (tontine_id, phone)
 );
 
@@ -51,6 +95,7 @@ CREATE TABLE IF NOT EXISTS cycles (
   payout_at TEXT,
   received_at TEXT,
   received_by TEXT REFERENCES memberships(id),
+  amount INTEGER,
   UNIQUE (tontine_id, idx)
 );
 
@@ -61,7 +106,7 @@ CREATE TABLE IF NOT EXISTS contributions (
   amount INTEGER NOT NULL,
   method TEXT NOT NULL,
   note TEXT,
-  paid_at TEXT NOT NULL DEFAULT (datetime('now')),
+  paid_at TEXT NOT NULL DEFAULT (${NOW}),
   paid_by TEXT REFERENCES users(id),
   UNIQUE (cycle_id, membership_id)
 );
@@ -76,7 +121,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   endpoint TEXT UNIQUE NOT NULL,
   p256dh TEXT NOT NULL,
   auth TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (${NOW})
 );
 
 CREATE TABLE IF NOT EXISTS reminders (
@@ -86,7 +131,7 @@ CREATE TABLE IF NOT EXISTS reminders (
   membership_id TEXT NOT NULL REFERENCES memberships(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK (kind IN ('membre','tresorier')),
   stage TEXT NOT NULL CHECK (stage IN ('avant','jour','retard')),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (${NOW}),
   UNIQUE (cycle_id, membership_id, kind, stage)
 );
 
@@ -101,7 +146,7 @@ CREATE TABLE IF NOT EXISTS refunds (
   status TEXT NOT NULL DEFAULT 'attente' CHECK (status IN ('attente','paye')),
   paid_at TEXT,
   paid_by TEXT REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (${NOW}),
   UNIQUE (tontine_id, membership_id)
 );
 
@@ -112,7 +157,7 @@ CREATE TABLE IF NOT EXISTS amount_changes (
   new_amount INTEGER NOT NULL,
   from_cycle INTEGER NOT NULL,
   created_by TEXT REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (${NOW})
 );
 
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -124,11 +169,107 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   amount INTEGER,
   method TEXT,
   note TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (${NOW})
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_tontine ON audit_logs(tontine_id);
 `;
+
+/** Crée les tables si elles n'existent pas (idempotent, safe à chaque démarrage). */
+export async function ensureSchema(): Promise<void> {
+  await pool.query(SCHEMA);
+}
+
+/* ------------------------------------------------------------------ */
+/* Helpers de requête                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Convertit les placeholders SQLite (`?`) en placeholders PostgreSQL (`$1`…).
+ * Les `?` à l'intérieur de littéraux entre guillemets simples sont ignorés.
+ */
+function placeholders(sql: string): string {
+  let n = 0;
+  let inStr = false;
+  let out = "";
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (ch === "'") inStr = !inStr;
+    if (ch === "?" && !inStr) out += `$${++n}`;
+    else out += ch;
+  }
+  return out;
+}
+
+// Client courant d'une transaction en cours (toutes les requêtes émises pendant
+// tx() partagent la même connexion), sinon le pool.
+const txStore = new AsyncLocalStorage<PoolClient>();
+
+async function exec(sql: string, params: unknown[]) {
+  const client = txStore.getStore();
+  const text = placeholders(sql);
+  return client ? client.query(text, params) : pool.query(text, params);
+}
+
+/** Toutes les lignes correspondantes. */
+export async function all<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+  const res = await exec(sql, params);
+  return res.rows as T[];
+}
+
+/** La première ligne, ou undefined. */
+export async function get<T>(sql: string, params: unknown[] = []): Promise<T | undefined> {
+  const res = await exec(sql, params);
+  return res.rows[0] as T | undefined;
+}
+
+/** Exécute une écriture, renvoie le nombre de lignes affectées. */
+export async function run(sql: string, params: unknown[] = []): Promise<number> {
+  const res = await exec(sql, params);
+  return res.rowCount ?? 0;
+}
+
+/**
+ * Enveloppe une série d'écritures dans une transaction (BEGIN/COMMIT, ROLLBACK
+ * en cas d'erreur). Toutes les requêtes faites dans `fn` — via all/get/run —
+ * partagent la même connexion.
+ */
+export async function tx<T>(fn: () => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await txStore.run(client, fn);
+    await client.query("COMMIT");
+    return out;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Divers                                                              */
+/* ------------------------------------------------------------------ */
+
+export function newId(): string {
+  return crypto.randomUUID();
+}
+
+/** Horodatage UTC « AAAA-MM-JJ HH:MM:SS », identique à SQLite datetime('now'). */
+export function sqlNow(): string {
+  return new Date().toISOString().slice(0, 19).replace("T", " ");
+}
+
+/** Horodatage UTC décalé de `days` jours (expiration des sessions…). */
+export function sqlNowPlusDays(days: number): string {
+  return new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 19).replace("T", " ");
+}
+
+/* ------------------------------------------------------------------ */
+/* Types (lignes de la base)                                           */
+/* ------------------------------------------------------------------ */
 
 export type UserRow = {
   id: string;
@@ -230,51 +371,3 @@ export type ReminderRow = {
   stage: "avant" | "jour" | "retard";
   created_at: string;
 };
-
-function create(): Database.Database {
-  const dataDir = path.join(process.cwd(), "data");
-  fs.mkdirSync(dataDir, { recursive: true });
-  const db = new Database(path.join(dataDir, "tontine.db"));
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.exec(SCHEMA);
-  migrate(db);
-  return db;
-}
-
-/** Colonnes ajoutées après la première version du schéma. */
-function migrate(db: Database.Database): void {
-  const columns = (table: string) =>
-    new Set((db.pragma(`table_info(${table})`) as { name: string }[]).map((r) => r.name));
-
-  const tontines = columns("tontines");
-  if (!tontines.has("closed_at")) db.exec("ALTER TABLE tontines ADD COLUMN closed_at TEXT");
-
-  const members = columns("memberships");
-  if (!members.has("status"))
-    db.exec("ALTER TABLE memberships ADD COLUMN status TEXT NOT NULL DEFAULT 'actif'");
-  if (!members.has("left_at")) db.exec("ALTER TABLE memberships ADD COLUMN left_at TEXT");
-
-  const cycles = columns("cycles");
-  if (!cycles.has("amount")) db.exec("ALTER TABLE cycles ADD COLUMN amount INTEGER");
-  db.exec(
-    `UPDATE cycles SET amount = (SELECT amount FROM tontines WHERE tontines.id = cycles.tontine_id)
-     WHERE amount IS NULL`
-  );
-  const hadReceived = cycles.has("received_at");
-  if (!hadReceived) {
-    db.exec("ALTER TABLE cycles ADD COLUMN received_at TEXT");
-    db.exec("ALTER TABLE cycles ADD COLUMN received_by TEXT REFERENCES memberships(id)");
-    // Une seule fois : les pots déjà versés avant l'ajout de la confirmation
-    // sont réputés reçus. Ne jamais rejouer cette valeur sur les cycles
-    // confirmés (la fonction peut être rappelée à chaque ouverture de base).
-    db.exec("UPDATE cycles SET received_at = payout_at WHERE received_at IS NULL AND payout_done = 1");
-  }
-}
-
-const g = globalThis as unknown as { __tontineDb?: Database.Database };
-export const db = g.__tontineDb ?? (g.__tontineDb = create());
-
-export function newId(): string {
-  return crypto.randomUUID();
-}

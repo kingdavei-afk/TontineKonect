@@ -42,31 +42,34 @@ export default async function TontineDetailPage({ params }: { params: Promise<{ 
   const user = await getUser();
   if (!user) redirect("/login");
 
-  const t = getTontine(id);
+  const t = await getTontine(id);
   if (!t) redirect("/tontines");
 
-  const members = getMembers(t.id);
+  const members = await getMembers(t.id);
   const me = members.find((m) => m.user_id === user.id);
   if (!me) redirect(`/tontines?code=${t.invite_code}`);
 
   const isOpen = t.status === "actif";
-  const cycles = isOpen ? ensureCycles(t) : getCycles(t.id);
+  const cycles = isOpen ? await ensureCycles(t) : await getCycles(t.id);
   const cur = currentCycle(cycles);
-  const curContribs = cur ? getCycleContributions(cur.id) : [];
+  const curContribs = cur ? await getCycleContributions(cur.id) : [];
   const paidIds = new Set(curContribs.map((c) => c.membership_id));
   const expected = cur ? expectedPayers(members, paidIds) : [];
   const unpaid = expected.filter((m) => !paidIds.has(m.id));
   const beneficiary = cur ? members.find((m) => m.id === cur.beneficiary_id) ?? null : null;
   const isTreasurer = !!me.is_treasurer;
   const history = cycles.filter((c) => c.payout_done && c.id !== cur?.id);
-  const pushStatus = pushStatusForTontine(t.id);
-  const refunds = getRefunds(t.id);
+  // Précalcul : les données du JSX ne peuvent pas await.
+  const historyContribs = new Map<string, Awaited<ReturnType<typeof getCycleContributions>>>();
+  for (const c of history) historyContribs.set(c.id, await getCycleContributions(c.id));
+  const pushStatus = await pushStatusForTontine(t.id);
+  const refunds = await getRefunds(t.id);
   const pendingRefunds = refunds.filter((r) => r.status === "attente");
-  const changes = getAmountChanges(t.id);
+  const changes = await getAmountChanges(t.id);
   const activeCount = members.filter((m) => m.status !== "parti").length;
-  const audit = getAuditLogs(t.id);
+  const audit = await getAuditLogs(t.id);
 
-  const allContribs = getAllContributions(t.id);
+  const allContribs = await getAllContributions(t.id);
   const myContribs = allContribs.filter((c) => c.membership_id === me.id);
   const myPaid = {
     n: myContribs.length,
@@ -654,7 +657,7 @@ export default async function TontineDetailPage({ params }: { params: Promise<{ 
           <ul className="mt-3 space-y-2">
             {history.map((c) => {
               const b = members.find((m) => m.id === c.beneficiary_id);
-              const cycleContribs = getCycleContributions(c.id);
+              const cycleContribs = historyContribs.get(c.id) ?? [];
               const collected = cycleContribs.reduce((s, x) => s + x.amount, 0);
               return (
                 <li key={c.id} className="rounded-lg bg-stone-50 px-3 py-2.5 text-sm">

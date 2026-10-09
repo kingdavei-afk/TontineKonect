@@ -51,22 +51,27 @@ code, suivez les cotisations de chaque tour et relancez les retardataires sur Wh
 
 - Next.js 16 (App Router, Server Actions) + React 19 + TypeScript
 - Tailwind CSS 4
-- SQLite via `better-sqlite3` (fichier `data/tontine.db`)
+- PostgreSQL (Neon) via `pg` — variable `DATABASE_URL`, schéma créé automatiquement
+  au démarrage (`instrumentation.ts` → `ensureSchema()`)
 - Sessions par cookie httpOnly, aucun service externe requis
 
 ## Lancer en local
 
 ```bash
 npm install
+# .env.local : DATABASE_URL (+ VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, CRON_SECRET optionnels)
 npm run dev        # http://localhost:3000
 ```
 
 Autres commandes : `npm run build` (build de production), `npm run lint`, `npm run start`.
 
-## Réinitialiser la base
+## Base de données
+
+- Le schéma est créé à chaque démarrage (`CREATE TABLE IF NOT EXISTS`, idempotent).
+- Transfert one-shot depuis l'ancien SQLite local (après `npm i -D better-sqlite3`) :
 
 ```bash
-rm -rf data        # supprime tontine.db (et recréé au prochain démarrage)
+node --experimental-strip-types scripts/transfer-sqlite-to-pg.ts
 ```
 
 ## Rappels automatiques
@@ -74,20 +79,23 @@ rm -rf data        # supprime tontine.db (et recréé au prochain démarrage)
 - Bouton 🔔 dans l&apos;en-tête : le membre autorise les notifications, son abonnement
   push est enregistré (`push_subscriptions`).
 - Un planificateur démarre avec le serveur (`instrumentation.ts`) et passe en revue les
-  tontines actives **toutes les 10 minutes** (`lib/reminders.ts`).
+  tontines actives **toutes les 10 minutes** (`lib/reminders.ts`) — désactivé sur Vercel
+  (instances éphémères), où le cron `vercel.json` déclenche `GET /api/reminders` chaque
+  matin.
 - Étapes : `avant` (J-2 / J-1), `jour` (échéance) , `retard` (après échéance) — chaque
   étape n&apos;envoie **qu&apos;une seule fois** par tour et par destinataire (table `reminders`,
   contrainte UNIQUE).
 - Déclenchement manuel / cron externe :
 
 ```bash
-curl "http://localhost:3000/api/reminders?secret=local-dev"
-# secret = variable CRON_SECRET, "local-dev" par défaut hors production
+curl -H "Authorization: Bearer $CRON_SECRET" "http://localhost:3000/api/reminders"
+# ou ?secret=$CRON_SECRET — CRON_SECRET vaut "local-dev" par défaut hors production
 ```
 
 - Les messages **WhatsApp** restent des liens pré-remplis (un clic) : l'envoi automatique
   passerait par l'API WhatsApp Business, non incluse dans ce MVP.
-- Clés VAPID générées au premier lancement et stockées dans `data/vapid.json`.
+- Clés VAPID : variables `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` en production,
+  sinon générées au premier lancement et stockées dans `data/vapid.json` (local).
 
 ## Règles de sortie d'argent
 
@@ -114,14 +122,16 @@ app/
   compte/page.tsx   # profil, statistiques, historique personnel des cotisations
 components/         # formulaires (client), tableau de bord filtrant, historique filtrant, en-tête, push, PWA
 lib/
-  db.ts             # schéma SQLite
+  db.ts             # pool Postgres, schéma, helpers async (all/get/run/tx)
   auth.ts           # téléphone + PIN, sessions, normalisation des numéros CI
   tontine.ts        # cycles, cotisations, pot, formats FCFA, départs/clôture
   csv.ts            # génération CSV Excel FR (« ; », BOM UTF-8) et dates JJ/MM/AAAA
   reminders.ts      # VAPID, abonnements push, moteur de rappels, planificateur
   constants.ts      # constantes partagées client/serveur (modes de paiement)
-instrumentation.ts   # démarre le planificateur au lancement du serveur
-app/api/reminders/   # route de déclenchement manuel (cron)
+instrumentation.ts   # crée le schéma + démarre le planificateur au lancement
+app/api/reminders/   # route cron (Authorization: Bearer CRON_SECRET)
+scripts/             # transfert one-shot SQLite → Postgres
+vercel.json          # cron quotidien Vercel sur /api/reminders
 public/             # manifest PWA, service worker (assets + notifications), icône
 ```
 

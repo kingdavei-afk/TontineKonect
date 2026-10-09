@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { db } from "@/lib/db";
+import { get } from "@/lib/db";
 import { formatPhone, getUser } from "@/lib/auth";
 import { formatFcfa, formatDate, getUserContributions } from "@/lib/tontine";
 import { logout } from "@/app/actions";
@@ -9,22 +9,22 @@ export default async function ComptePage() {
   const user = await getUser();
   if (!user) redirect("/login");
 
-  const stats = db
-    .prepare(
-      `SELECT COUNT(DISTINCT m.tontine_id) AS tontines
-       FROM memberships m WHERE m.user_id = ?`
-    )
-    .get(user.id) as { tontines: number };
+  const stats = await get<{ tontines: number }>(
+    `SELECT COUNT(DISTINCT m.tontine_id) AS tontines
+     FROM memberships m WHERE m.user_id = ?`,
+    [user.id]
+  );
+  if (!stats) redirect("/login");
 
-  const given = db
-    .prepare(
-      `SELECT COALESCE(SUM(c.amount), 0) AS total, COUNT(*) AS n
-       FROM contributions c JOIN memberships m ON m.id = c.membership_id
-       WHERE m.user_id = ?`
-    )
-    .get(user.id) as { total: number; n: number };
+  const given = await get<{ total: number; n: number }>(
+    `SELECT COALESCE(SUM(c.amount), 0) AS total, COUNT(*) AS n
+     FROM contributions c JOIN memberships m ON m.id = c.membership_id
+     WHERE m.user_id = ?`,
+    [user.id]
+  );
+  if (!given) redirect("/login");
 
-  const history = getUserContributions(user.id, 100);
+  const history = await getUserContributions(user.id, 100);
 
   return (
     <div className="mx-auto max-w-lg space-y-6">

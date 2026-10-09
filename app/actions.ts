@@ -2,7 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
-import { db, newId, type CycleRow, type MembershipRow } from "@/lib/db";
+import { get, newId, run, type CycleRow, type MembershipRow } from "@/lib/db";
 import {
   createUserSession,
   destroyUserSession,
@@ -45,11 +45,12 @@ async function requireUser() {
 }
 
 async function requireTreasurer(tontineId: string, userId: string) {
-  const t = getTontine(tontineId);
+  const t = await getTontine(tontineId);
   if (!t) redirect("/tontines");
-  const m = db
-    .prepare("SELECT * FROM memberships WHERE tontine_id = ? AND user_id = ?")
-    .get(tontineId, userId) as MembershipRow | undefined;
+  const m = await get<MembershipRow>(
+    "SELECT * FROM memberships WHERE tontine_id = ? AND user_id = ?",
+    [tontineId, userId]
+  );
   if (!m || !m.is_treasurer) redirect(`/tontines/${tontineId}`);
   return { t, membership: m };
 }
@@ -64,16 +65,16 @@ export async function register(_prev: FormState, formData: FormData): Promise<Fo
   if (name.length < 2) return { error: "Entrez votre nom complet." };
   if (!phone) return { error: "Numéro invalide. Format : 07 07 12 34 56." };
   if (!/^\d{4,6}$/.test(pin)) return { error: "Le code secret doit contenir 4 à 6 chiffres." };
-  if (findUserByPhone(phone)) return { error: "Un compte existe déjà avec ce numéro." };
+  if (await findUserByPhone(phone)) return { error: "Un compte existe déjà avec ce numéro." };
 
   const id = newId();
-  db.prepare("INSERT INTO users (id, phone, name, pin) VALUES (?, ?, ?, ?)").run(
+  await run("INSERT INTO users (id, phone, name, pin) VALUES (?, ?, ?, ?)", [
     id,
     phone,
     name,
-    hashPin(pin)
-  );
-  linkPendingMemberships(id, phone, name);
+    hashPin(pin),
+  ]);
+  await linkPendingMemberships(id, phone, name);
   await createUserSession(id);
   redirect("/tontines");
 }
@@ -81,7 +82,7 @@ export async function register(_prev: FormState, formData: FormData): Promise<Fo
 export async function login(_prev: FormState, formData: FormData): Promise<FormState> {
   const phone = normalizePhone(String(formData.get("phone") ?? ""));
   const pin = String(formData.get("pin") ?? "");
-  const user = phone ? findUserByPhone(phone) : undefined;
+  const user = phone ? await findUserByPhone(phone) : undefined;
   if (!user || !verifyPin(pin, user.pin)) {
     return { error: "Numéro ou code secret incorrect." };
   }
@@ -109,12 +110,13 @@ export async function createTontine(_prev: FormState, formData: FormData): Promi
   if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) return { error: "Date de début invalide." };
 
   const tontineId = newId();
-  db.prepare(
+  await run(
     `INSERT INTO tontines (id, name, amount, frequency, start_date, creator_id, invite_code)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(tontineId, name, Math.round(amount), frequency, startDate, user.id, generateInviteCode());
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [tontineId, name, Math.round(amount), frequency, startDate, user.id, generateInviteCode()]
+  );
 
-  addMember({
+  await addMember({
     tontineId,
     phone: user.phone,
     name: user.name,
@@ -122,8 +124,9 @@ export async function createTontine(_prev: FormState, formData: FormData): Promi
     treasurer: true,
     actorUserId: user.id,
   });
-  const t = getTontine(tontineId)!;
-  ensureCycles(t);
+  const t = await getTontine(tontineId);
+  if (!t) redirect("/tontines");
+  await ensureCycles(t);
 
   redirect(`/tontines/${tontineId}`);
 }
@@ -131,16 +134,17 @@ export async function createTontine(_prev: FormState, formData: FormData): Promi
 export async function joinTontine(_prev: FormState, formData: FormData): Promise<FormState> {
   const user = await requireUser();
   const code = String(formData.get("code") ?? "").trim().toUpperCase();
-  const t = getTontineByCode(code);
+  const t = await getTontineByCode(code);
   if (!t) return { error: "Code d'invitation introuvable." };
 
-  const existing = db
-    .prepare("SELECT id FROM memberships WHERE tontine_id = ? AND phone = ?")
-    .get(t.id, user.phone);
+  const existing = await get("SELECT id FROM memberships WHERE tontine_id = ? AND phone = ?", [
+    t.id,
+    user.phone,
+  ]);
   if (existing) redirect(`/tontines/${t.id}`);
 
-  addMember({ tontineId: t.id, phone: user.phone, name: user.name, userId: user.id, actorUserId: user.id });
-  ensureCycles(t);
+  await addMember({ tontineId: t.id, phone: user.phone, name: user.name, userId: user.id, actorUserId: user.id });
+  await ensureCycles(t);
   redirect(`/tontines/${t.id}`);
 }
 
@@ -155,15 +159,15 @@ export async function addMemberManually(_prev: FormState, formData: FormData): P
   if (name.length < 2) return { error: "Entrez le nom du membre." };
   if (!phone) return { error: "Numéro invalide. Format : 07 07 12 34 56." };
 
-  const linked = findUserByPhone(phone);
-  addMember({
+  const linked = await findUserByPhone(phone);
+  await addMember({
     tontineId,
     phone,
     name,
     userId: linked ? linked.id : null,
     actorUserId: user.id,
   });
-  ensureCycles(t);
+  await ensureCycles(t);
   revalidatePath(`/tontines/${tontineId}`);
   return { ok: true };
 }
@@ -179,14 +183,18 @@ export async function pay(formData: FormData): Promise<void> {
   const { t } = await requireTreasurer(tontineId, user.id);
   if (t.status !== "actif") redirect(`/tontines/${tontineId}`);
 
-  const m = db.prepare("SELECT * FROM memberships WHERE id = ? AND tontine_id = ?").get(membershipId, tontineId);
+  const m = await get<MembershipRow>("SELECT * FROM memberships WHERE id = ? AND tontine_id = ?", [
+    membershipId,
+    tontineId,
+  ]);
   if (!m) redirect(`/tontines/${tontineId}`);
-  const cycle = db
-    .prepare("SELECT * FROM cycles WHERE id = ? AND tontine_id = ?")
-    .get(cycleId, tontineId) as CycleRow | undefined;
+  const cycle = await get<CycleRow>("SELECT * FROM cycles WHERE id = ? AND tontine_id = ?", [
+    cycleId,
+    tontineId,
+  ]);
   if (!cycle) redirect(`/tontines/${tontineId}`);
 
-  markContribution({
+  await markContribution({
     cycleId,
     membershipId,
     amount: cycleAmount(cycle, t),
@@ -203,7 +211,7 @@ export async function unpay(formData: FormData): Promise<void> {
   const membershipId = String(formData.get("membership_id") ?? "");
   await requireTreasurer(tontineId, user.id);
 
-  unmarkContribution(cycleId, membershipId, user.id);
+  await unmarkContribution(cycleId, membershipId, user.id);
   revalidatePath(`/tontines/${tontineId}`);
 }
 
@@ -213,12 +221,12 @@ export async function savePushSubscription(
   sub: PushSubscriptionJson
 ): Promise<{ ok: boolean }> {
   const user = await requireUser();
-  return { ok: saveSubscription(user.id, sub) };
+  return { ok: await saveSubscription(user.id, sub) };
 }
 
 export async function removePushSubscription(endpoint: string): Promise<{ ok: boolean }> {
   const user = await requireUser();
-  removeSubscription(user.id, endpoint);
+  await removeSubscription(user.id, endpoint);
   return { ok: true };
 }
 
@@ -230,7 +238,7 @@ export async function payout(formData: FormData): Promise<void> {
   const { t } = await requireTreasurer(tontineId, user.id);
   if (t.status !== "actif") redirect(`/tontines/${tontineId}`);
 
-  markPayout(cycleId, action === "done", user.id);
+  await markPayout(cycleId, action === "done", user.id);
   revalidatePath(`/tontines/${tontineId}`);
 }
 
@@ -239,23 +247,25 @@ export async function confirmReceiptAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const tontineId = String(formData.get("tontine_id") ?? "");
   const cycleId = String(formData.get("cycle_id") ?? "");
-  const t = getTontine(tontineId);
+  const t = await getTontine(tontineId);
   if (!t) redirect("/tontines");
 
-  const me = db
-    .prepare("SELECT * FROM memberships WHERE tontine_id = ? AND user_id = ?")
-    .get(tontineId, user.id) as MembershipRow | undefined;
+  const me = await get<MembershipRow>(
+    "SELECT * FROM memberships WHERE tontine_id = ? AND user_id = ?",
+    [tontineId, user.id]
+  );
   if (!me) redirect(`/tontines/${tontineId}`);
 
-  const cycle = db
-    .prepare("SELECT * FROM cycles WHERE id = ? AND tontine_id = ?")
-    .get(cycleId, tontineId) as CycleRow | undefined;
+  const cycle = await get<CycleRow>("SELECT * FROM cycles WHERE id = ? AND tontine_id = ?", [
+    cycleId,
+    tontineId,
+  ]);
   if (!cycle) redirect(`/tontines/${tontineId}`);
 
   const isBeneficiary = cycle.beneficiary_id === me.id;
   if (!isBeneficiary && !me.is_treasurer) redirect(`/tontines/${tontineId}`);
 
-  confirmCycleReceipt({
+  await confirmCycleReceipt({
     cycleId,
     actorUserId: user.id,
     actorMembershipId: me.id,
@@ -272,7 +282,7 @@ export async function changeAmountAction(_prev: FormState, formData: FormData): 
   await requireTreasurer(tontineId, user.id);
   const amount = Number(formData.get("amount"));
 
-  const res = changeAmount(tontineId, amount, user.id);
+  const res = await changeAmount(tontineId, amount, user.id);
   if (!res.ok) return { error: res.error };
   revalidatePath(`/tontines/${tontineId}`);
   return { ok: true, message: res.message };
@@ -284,7 +294,7 @@ export async function leaveMemberAction(_prev: FormState, formData: FormData): P
   await requireTreasurer(tontineId, user.id);
   const membershipId = String(formData.get("membership_id") ?? "");
 
-  const res = leaveMember(tontineId, membershipId, user.id);
+  const res = await leaveMember(tontineId, membershipId, user.id);
   if (!res.ok) return { error: res.error };
   revalidatePath(`/tontines/${tontineId}`);
   return { ok: true, message: res.message };
@@ -295,7 +305,7 @@ export async function markRefundPaidAction(_prev: FormState, formData: FormData)
   const tontineId = String(formData.get("tontine_id") ?? "");
   await requireTreasurer(tontineId, user.id);
 
-  const res = markRefundPaid({
+  const res = await markRefundPaid({
     refundId: String(formData.get("refund_id") ?? ""),
     tontineId,
     amount: Number(formData.get("amount")),
@@ -312,7 +322,7 @@ export async function unmarkRefundPaidAction(formData: FormData): Promise<void> 
   const user = await requireUser();
   const tontineId = String(formData.get("tontine_id") ?? "");
   await requireTreasurer(tontineId, user.id);
-  unmarkRefundPaid(String(formData.get("refund_id") ?? ""), tontineId, user.id);
+  await unmarkRefundPaid(String(formData.get("refund_id") ?? ""), tontineId, user.id);
   revalidatePath(`/tontines/${tontineId}`);
 }
 
@@ -321,7 +331,7 @@ export async function closeTontineAction(_prev: FormState, formData: FormData): 
   const tontineId = String(formData.get("tontine_id") ?? "");
   await requireTreasurer(tontineId, user.id);
 
-  const res = closeTontine(tontineId, user.id);
+  const res = await closeTontine(tontineId, user.id);
   if (!res.ok) return { error: res.error };
   revalidatePath(`/tontines/${tontineId}`);
   revalidatePath("/tontines");

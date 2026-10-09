@@ -1,6 +1,9 @@
 import {
-  db,
+  all,
+  get,
   newId,
+  run,
+  tx,
   type AuditLogRow,
   type ContributionRow,
   type CycleRow,
@@ -12,6 +15,9 @@ import { formatFcfa, formatDate } from "./constants";
 
 // Formats partagés avec les composants client.
 export { formatFcfa, formatDate };
+
+// Horodatage UTC compatible SQLite datetime('now') (voir lib/db.ts).
+const NOW = `to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')`;
 
 export const FREQUENCIES: Record<TontineRow["frequency"], { label: string; days: number | null }> = {
   hebdo: { label: "Hebdomadaire", days: 7 },
@@ -45,25 +51,25 @@ export function generateInviteCode(): string {
 
 /* ---------- Lecture ---------- */
 
-export function getTontine(id: string): TontineRow | undefined {
-  return db.prepare("SELECT * FROM tontines WHERE id = ?").get(id) as TontineRow | undefined;
+export async function getTontine(id: string): Promise<TontineRow | undefined> {
+  return get<TontineRow>("SELECT * FROM tontines WHERE id = ?", [id]);
 }
 
-export function getTontineByCode(code: string): TontineRow | undefined {
-  return db
-    .prepare("SELECT * FROM tontines WHERE invite_code = ?")
-    .get(code.trim().toUpperCase()) as TontineRow | undefined;
+export async function getTontineByCode(code: string): Promise<TontineRow | undefined> {
+  return get<TontineRow>("SELECT * FROM tontines WHERE invite_code = ?", [
+    code.trim().toUpperCase(),
+  ]);
 }
 
-export function getMembers(tontineId: string): MembershipRow[] {
-  return db
-    .prepare("SELECT * FROM memberships WHERE tontine_id = ? ORDER BY position ASC")
-    .all(tontineId) as MembershipRow[];
+export async function getMembers(tontineId: string): Promise<MembershipRow[]> {
+  return all<MembershipRow>("SELECT * FROM memberships WHERE tontine_id = ? ORDER BY position ASC", [
+    tontineId,
+  ]);
 }
 
 /** Membres qui cotisent encore (les partis sont exclus). */
-export function getActiveMembers(tontineId: string): MembershipRow[] {
-  return getMembers(tontineId).filter((m) => m.status !== "parti");
+export async function getActiveMembers(tontineId: string): Promise<MembershipRow[]> {
+  return (await getMembers(tontineId)).filter((m) => m.status !== "parti");
 }
 
 export type RefundWithMember = RefundRow & {
@@ -71,31 +77,26 @@ export type RefundWithMember = RefundRow & {
   paid_by_name: string | null;
 };
 
-export function getRefunds(tontineId: string): RefundWithMember[] {
-  const refunds = db
-    .prepare(
-      `SELECT r.*, u.name AS paid_by_name
-       FROM refunds r LEFT JOIN users u ON u.id = r.paid_by
-       WHERE r.tontine_id = ? ORDER BY r.created_at DESC`
-    )
-    .all(tontineId) as (RefundRow & { paid_by_name: string | null })[];
-  const members = new Map(getMembers(tontineId).map((m) => [m.id, m]));
+export async function getRefunds(tontineId: string): Promise<RefundWithMember[]> {
+  const refunds = await all<RefundRow & { paid_by_name: string | null }>(
+    `SELECT r.*, u.name AS paid_by_name
+     FROM refunds r LEFT JOIN users u ON u.id = r.paid_by
+     WHERE r.tontine_id = ? ORDER BY r.created_at DESC`,
+    [tontineId]
+  );
+  const members = new Map((await getMembers(tontineId)).map((m) => [m.id, m]));
   return refunds.flatMap((r) => {
     const member = members.get(r.membership_id);
     return member ? [{ ...r, member }] : [];
   });
 }
 
-export function getCycles(tontineId: string): CycleRow[] {
-  return db
-    .prepare("SELECT * FROM cycles WHERE tontine_id = ? ORDER BY idx ASC")
-    .all(tontineId) as CycleRow[];
+export async function getCycles(tontineId: string): Promise<CycleRow[]> {
+  return all<CycleRow>("SELECT * FROM cycles WHERE tontine_id = ? ORDER BY idx ASC", [tontineId]);
 }
 
-export function getCycleContributions(cycleId: string): ContributionRow[] {
-  return db
-    .prepare("SELECT * FROM contributions WHERE cycle_id = ?")
-    .all(cycleId) as ContributionRow[];
+export async function getCycleContributions(cycleId: string): Promise<ContributionRow[]> {
+  return all<ContributionRow>("SELECT * FROM contributions WHERE cycle_id = ?", [cycleId]);
 }
 
 export type ContributionFull = {
@@ -114,21 +115,20 @@ export type ContributionFull = {
 };
 
 /** Toutes les cotisations de la tontine, tous tours confondus (export CSV). */
-export function getAllContributions(tontineId: string): ContributionFull[] {
-  return db
-    .prepare(
-      `SELECT c.membership_id, cy.idx, cy.due_date, cy.payout_done, cy.received_at,
-              b.name AS beneficiary, m.name AS member, m.phone,
-              c.amount, c.method, c.paid_at, u.name AS paid_by_name
-       FROM contributions c
-       JOIN cycles cy ON cy.id = c.cycle_id
-       JOIN memberships m ON m.id = c.membership_id
-       LEFT JOIN memberships b ON b.id = cy.beneficiary_id
-       LEFT JOIN users u ON u.id = c.paid_by
-       WHERE cy.tontine_id = ?
-       ORDER BY cy.idx, m.position`
-    )
-    .all(tontineId) as ContributionFull[];
+export async function getAllContributions(tontineId: string): Promise<ContributionFull[]> {
+  return all<ContributionFull>(
+    `SELECT c.membership_id, cy.idx, cy.due_date, cy.payout_done, cy.received_at,
+            b.name AS beneficiary, m.name AS member, m.phone,
+            c.amount, c.method, c.paid_at, u.name AS paid_by_name
+     FROM contributions c
+     JOIN cycles cy ON cy.id = c.cycle_id
+     JOIN memberships m ON m.id = c.membership_id
+     LEFT JOIN memberships b ON b.id = cy.beneficiary_id
+     LEFT JOIN users u ON u.id = c.paid_by
+     WHERE cy.tontine_id = ?
+     ORDER BY cy.idx, m.position`,
+    [tontineId]
+  );
 }
 
 export type MemberStat = {
@@ -144,21 +144,20 @@ export type MemberStat = {
 };
 
 /** Membres de la tontine + cotisations déjà versées (export CSV). */
-export function getMemberStats(tontineId: string): MemberStat[] {
-  return db
-    .prepare(
-      `SELECT m.position, m.name, m.phone, m.status, m.is_treasurer,
-              m.joined_at, m.left_at,
-              (SELECT COUNT(*) FROM contributions c JOIN cycles cy ON cy.id = c.cycle_id
-               WHERE c.membership_id = m.id AND cy.tontine_id = m.tontine_id) AS paid_n,
-              (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c
-               JOIN cycles cy ON cy.id = c.cycle_id
-               WHERE c.membership_id = m.id AND cy.tontine_id = m.tontine_id) AS paid_total
-       FROM memberships m
-       WHERE m.tontine_id = ?
-       ORDER BY m.position`
-    )
-    .all(tontineId) as MemberStat[];
+export async function getMemberStats(tontineId: string): Promise<MemberStat[]> {
+  return all<MemberStat>(
+    `SELECT m.position, m.name, m.phone, m.status, m.is_treasurer,
+            m.joined_at, m.left_at,
+            (SELECT COUNT(*) FROM contributions c JOIN cycles cy ON cy.id = c.cycle_id
+             WHERE c.membership_id = m.id AND cy.tontine_id = m.tontine_id) AS paid_n,
+            (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c
+             JOIN cycles cy ON cy.id = c.cycle_id
+             WHERE c.membership_id = m.id AND cy.tontine_id = m.tontine_id) AS paid_total
+     FROM memberships m
+     WHERE m.tontine_id = ?
+     ORDER BY m.position`,
+    [tontineId]
+  );
 }
 
 export type UserContribution = {
@@ -171,40 +170,35 @@ export type UserContribution = {
 };
 
 /** Cotisations d'un utilisateur dans toutes ses tontines (espace membre). */
-export function getUserContributions(userId: string, limit = 100): UserContribution[] {
-  return db
-    .prepare(
-      `SELECT t.id AS tontine_id, t.name AS tontine_name, cy.idx,
-              c.amount, c.method, c.paid_at
-       FROM contributions c
-       JOIN cycles cy ON cy.id = c.cycle_id
-       JOIN tontines t ON t.id = cy.tontine_id
-       JOIN memberships m ON m.id = c.membership_id
-       WHERE m.user_id = ?
-       ORDER BY c.paid_at DESC, c.rowid DESC
-       LIMIT ?`
-    )
-    .all(userId, limit) as UserContribution[];
+export async function getUserContributions(
+  userId: string,
+  limit = 100
+): Promise<UserContribution[]> {
+  return all<UserContribution>(
+    `SELECT t.id AS tontine_id, t.name AS tontine_name, cy.idx,
+            c.amount, c.method, c.paid_at
+     FROM contributions c
+     JOIN cycles cy ON cy.id = c.cycle_id
+     JOIN tontines t ON t.id = cy.tontine_id
+     JOIN memberships m ON m.id = c.membership_id
+     WHERE m.user_id = ?
+     ORDER BY c.paid_at DESC, c.ctid DESC
+     LIMIT ?`,
+    [userId, limit]
+  );
 }
 
 /* ---------- Écriture : cycles ---------- */
 
 /** Génère les tours manquants (1 tour = 1 bénéficiaire, parmi les membres actifs). */
-export function ensureCycles(t: TontineRow): CycleRow[] {
-  const active = getActiveMembers(t.id);
-  const existing = getCycles(t.id);
-  const insert = db.prepare(
-    `INSERT INTO cycles (id, tontine_id, idx, due_date, beneficiary_id, amount)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  );
+export async function ensureCycles(t: TontineRow): Promise<CycleRow[]> {
+  const active = await getActiveMembers(t.id);
+  const existing = await getCycles(t.id);
   for (let idx = existing.length + 1; idx <= active.length; idx++) {
-    insert.run(
-      newId(),
-      t.id,
-      idx,
-      addInterval(t.start_date, t.frequency, idx - 1),
-      active[idx - 1].id,
-      t.amount
+    await run(
+      `INSERT INTO cycles (id, tontine_id, idx, due_date, beneficiary_id, amount)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [newId(), t.id, idx, addInterval(t.start_date, t.frequency, idx - 1), active[idx - 1].id, t.amount]
     );
   }
   return getCycles(t.id);
@@ -224,14 +218,12 @@ export function cycleAmount(cycle: CycleRow, t: TontineRow): number {
 }
 
 /** Déjà payé dans ce tour. */
-export function paidIdsOf(cycleId: string): Set<string> {
-  return new Set(
-    (
-      db
-        .prepare("SELECT membership_id FROM contributions WHERE cycle_id = ?")
-        .all(cycleId) as { membership_id: string }[]
-    ).map((r) => r.membership_id)
+export async function paidIdsOf(cycleId: string): Promise<Set<string>> {
+  const rows = await all<{ membership_id: string }>(
+    "SELECT membership_id FROM contributions WHERE cycle_id = ?",
+    [cycleId]
   );
+  return new Set(rows.map((r) => r.membership_id));
 }
 
 /**
@@ -291,19 +283,20 @@ export const AUDIT_LABELS: Record<AuditAction, string> = {
 };
 
 /** Trace qui a validé quoi, quand et avec quel mode de paiement. */
-export function logAudit(entry: AuditEntry): void {
-  db.prepare(
+export async function logAudit(entry: AuditEntry): Promise<void> {
+  await run(
     `INSERT INTO audit_logs (id, tontine_id, actor_user_id, action, target, amount, method, note)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    newId(),
-    entry.tontineId,
-    entry.actorUserId,
-    entry.action,
-    entry.target ?? null,
-    entry.amount ?? null,
-    entry.method ?? null,
-    entry.note ?? null
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      newId(),
+      entry.tontineId,
+      entry.actorUserId,
+      entry.action,
+      entry.target ?? null,
+      entry.amount ?? null,
+      entry.method ?? null,
+      entry.note ?? null,
+    ]
   );
 }
 
@@ -312,205 +305,215 @@ export type AuditLogWithActor = AuditLogRow & {
   actor_phone: string | null;
 };
 
-export function getAuditLogs(tontineId: string, limit = 50): AuditLogWithActor[] {
-  return db
-    .prepare(
-      `SELECT a.*, u.name AS actor_name, u.phone AS actor_phone
-       FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id
-       WHERE a.tontine_id = ?
-       ORDER BY a.created_at DESC, a.rowid DESC LIMIT ?`
-    )
-    .all(tontineId, limit) as AuditLogWithActor[];
+export async function getAuditLogs(tontineId: string, limit = 50): Promise<AuditLogWithActor[]> {
+  return all<AuditLogWithActor>(
+    `SELECT a.*, u.name AS actor_name, u.phone AS actor_phone
+     FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id
+     WHERE a.tontine_id = ?
+     ORDER BY a.created_at DESC, a.ctid DESC LIMIT ?`,
+    [tontineId, limit]
+  );
 }
 
 /** Nom du bénéficiaire d'un tour (pour le journal d'audit). */
-function beneficiaryLabel(cycleId: string): string | null {
-  const row = db
-    .prepare(
-      `SELECT m.name FROM cycles c LEFT JOIN memberships m ON m.id = c.beneficiary_id
-       WHERE c.id = ?`
-    )
-    .get(cycleId) as { name: string | null } | undefined;
+async function beneficiaryLabel(cycleId: string): Promise<string | null> {
+  const row = await get<{ name: string | null }>(
+    `SELECT m.name FROM cycles c LEFT JOIN memberships m ON m.id = c.beneficiary_id
+     WHERE c.id = ?`,
+    [cycleId]
+  );
   return row?.name ?? null;
 }
 
-function cycleTontineId(cycleId: string): string {
-  const row = db.prepare("SELECT tontine_id FROM cycles WHERE id = ?").get(cycleId) as
-    | { tontine_id: string }
-    | undefined;
+async function cycleTontineId(cycleId: string): Promise<string> {
+  const row = await get<{ tontine_id: string }>("SELECT tontine_id FROM cycles WHERE id = ?", [
+    cycleId,
+  ]);
   return row?.tontine_id ?? "";
 }
 
-function cycleIdx(cycleId: string): number | string {
-  const row = db.prepare("SELECT idx FROM cycles WHERE id = ?").get(cycleId) as
-    | { idx: number }
-    | undefined;
+async function cycleIdx(cycleId: string): Promise<number | string> {
+  const row = await get<{ idx: number }>("SELECT idx FROM cycles WHERE id = ?", [cycleId]);
   return row?.idx ?? "?";
 }
 
-function cyclePotAmount(cycleId: string): number | null {
-  const row = db
-    .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM contributions WHERE cycle_id = ?")
-    .get(cycleId) as { total: number } | undefined;
+async function cyclePotAmount(cycleId: string): Promise<number | null> {
+  const row = await get<{ total: number }>(
+    "SELECT COALESCE(SUM(amount), 0) AS total FROM contributions WHERE cycle_id = ?",
+    [cycleId]
+  );
   if (row && row.total > 0) return row.total;
-  const cyc = db.prepare("SELECT amount FROM cycles WHERE id = ?").get(cycleId) as
-    | { amount: number | null }
-    | undefined;
+  const cyc = await get<{ amount: number | null }>("SELECT amount FROM cycles WHERE id = ?", [
+    cycleId,
+  ]);
   return cyc?.amount ?? null;
 }
 
-function memberLabel(membershipId: string): string | null {
-  const row = db.prepare("SELECT name FROM memberships WHERE id = ?").get(membershipId) as
-    | { name: string }
-    | undefined;
+async function memberLabel(membershipId: string): Promise<string | null> {
+  const row = await get<{ name: string }>("SELECT name FROM memberships WHERE id = ?", [
+    membershipId,
+  ]);
   return row?.name ?? null;
 }
 
 /* ---------- Écriture : membres ---------- */
 
-export function addMember(input: {
+export async function addMember(input: {
   tontineId: string;
   phone: string;
   name: string;
   userId?: string | null;
   treasurer?: boolean;
   actorUserId?: string | null;
-}): MembershipRow {
-  const already = db
-    .prepare("SELECT * FROM memberships WHERE tontine_id = ? AND phone = ?")
-    .get(input.tontineId, input.phone) as MembershipRow | undefined;
+}): Promise<MembershipRow> {
+  const already = await get<MembershipRow>(
+    "SELECT * FROM memberships WHERE tontine_id = ? AND phone = ?",
+    [input.tontineId, input.phone]
+  );
   if (already) {
     if (input.userId && !already.user_id) {
-      db.prepare("UPDATE memberships SET user_id = ?, name = ? WHERE id = ?").run(
+      await run("UPDATE memberships SET user_id = ?, name = ? WHERE id = ?", [
         input.userId,
         input.name,
-        already.id
-      );
-      return db.prepare("SELECT * FROM memberships WHERE id = ?").get(already.id) as MembershipRow;
+        already.id,
+      ]);
+      return (await get<MembershipRow>("SELECT * FROM memberships WHERE id = ?", [
+        already.id,
+      ])) as MembershipRow;
     }
     return already;
   }
-  const pos = db
-    .prepare("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM memberships WHERE tontine_id = ?")
-    .get(input.tontineId) as { p: number };
+  const pos = await get<{ p: number }>(
+    "SELECT COALESCE(MAX(position), 0) + 1 AS p FROM memberships WHERE tontine_id = ?",
+    [input.tontineId]
+  );
   const id = newId();
-  db.prepare(
+  await run(
     `INSERT INTO memberships (id, tontine_id, user_id, phone, name, position, is_treasurer)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, input.tontineId, input.userId ?? null, input.phone, input.name, pos.p, input.treasurer ? 1 : 0);
-  logAudit({
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, input.tontineId, input.userId ?? null, input.phone, input.name, pos?.p ?? 1, input.treasurer ? 1 : 0]
+  );
+  await logAudit({
     tontineId: input.tontineId,
     actorUserId: input.actorUserId ?? null,
     action: "membre_ajoute",
     target: input.name,
     note: input.treasurer ? "Trésorier (créateur)" : null,
   });
-  return db.prepare("SELECT * FROM memberships WHERE id = ?").get(id) as MembershipRow;
+  return (await get<MembershipRow>("SELECT * FROM memberships WHERE id = ?", [id])) as MembershipRow;
 }
 
 /** Relie les inscriptions en attente (téléphone renseigné avant le compte). */
-export function linkPendingMemberships(userId: string, phone: string, name: string): void {
-  db.prepare(
+export async function linkPendingMemberships(
+  userId: string,
+  phone: string,
+  name: string
+): Promise<void> {
+  await run(
     `UPDATE memberships SET user_id = ?, name = ?
-     WHERE phone = ? AND user_id IS NULL`
-  ).run(userId, name, phone);
+     WHERE phone = ? AND user_id IS NULL`,
+    [userId, name, phone]
+  );
 }
 
 /* ---------- Écriture : cotisations ---------- */
 
-export function markContribution(input: {
+export async function markContribution(input: {
   cycleId: string;
   membershipId: string;
   amount: number;
   method: string;
   paidBy: string;
   note?: string;
-}): void {
-  db.prepare(
+}): Promise<void> {
+  await run(
     `INSERT INTO contributions (id, cycle_id, membership_id, amount, method, note, paid_by)
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(cycle_id, membership_id)
      DO UPDATE SET amount = excluded.amount, method = excluded.method,
-                   note = excluded.note, paid_at = datetime('now'), paid_by = excluded.paid_by`
-  ).run(newId(), input.cycleId, input.membershipId, input.amount, input.method, input.note ?? null, input.paidBy);
-  logAudit({
-    tontineId: cycleTontineId(input.cycleId),
+                   note = excluded.note, paid_at = ${NOW}, paid_by = excluded.paid_by`,
+    [newId(), input.cycleId, input.membershipId, input.amount, input.method, input.note ?? null, input.paidBy]
+  );
+  await logAudit({
+    tontineId: await cycleTontineId(input.cycleId),
     actorUserId: input.paidBy,
     action: "cotisation_validee",
-    target: memberLabel(input.membershipId),
+    target: await memberLabel(input.membershipId),
     amount: input.amount,
     method: input.method,
-    note: `Tour n°${cycleIdx(input.cycleId)}`,
+    note: `Tour n°${await cycleIdx(input.cycleId)}`,
   });
 }
 
-export function unmarkContribution(
+export async function unmarkContribution(
   cycleId: string,
   membershipId: string,
   actorUserId: string
-): void {
-  const prev = db
-    .prepare("SELECT amount, method FROM contributions WHERE cycle_id = ? AND membership_id = ?")
-    .get(cycleId, membershipId) as { amount: number; method: string } | undefined;
-  db.prepare("DELETE FROM contributions WHERE cycle_id = ? AND membership_id = ?").run(
-    cycleId,
-    membershipId
+): Promise<void> {
+  const prev = await get<{ amount: number; method: string }>(
+    "SELECT amount, method FROM contributions WHERE cycle_id = ? AND membership_id = ?",
+    [cycleId, membershipId]
   );
-  logAudit({
-    tontineId: cycleTontineId(cycleId),
+  await run("DELETE FROM contributions WHERE cycle_id = ? AND membership_id = ?", [
+    cycleId,
+    membershipId,
+  ]);
+  await logAudit({
+    tontineId: await cycleTontineId(cycleId),
     actorUserId,
     action: "cotisation_annulee",
-    target: memberLabel(membershipId),
+    target: await memberLabel(membershipId),
     amount: prev?.amount ?? null,
     method: prev?.method ?? null,
-    note: `Tour n°${cycleIdx(cycleId)}`,
+    note: `Tour n°${await cycleIdx(cycleId)}`,
   });
 }
 
-export function markPayout(
+export async function markPayout(
   cycleId: string,
   done: boolean,
   actorUserId: string
-): void {
-  db.prepare(
-    "UPDATE cycles SET payout_done = ?, payout_at = CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END, received_at = CASE WHEN ? = 1 THEN received_at ELSE NULL END, received_by = CASE WHEN ? = 1 THEN received_by ELSE NULL END WHERE id = ?"
-  ).run(done ? 1 : 0, done ? 1 : 0, done ? 1 : 0, done ? 1 : 0, cycleId);
-  const beneficiary = beneficiaryLabel(cycleId);
-  logAudit({
-    tontineId: cycleTontineId(cycleId),
+): Promise<void> {
+  await run(
+    "UPDATE cycles SET payout_done = ?, payout_at = CASE WHEN ? = 1 THEN " +
+      NOW +
+      " ELSE NULL END, received_at = CASE WHEN ? = 1 THEN received_at ELSE NULL END, received_by = CASE WHEN ? = 1 THEN received_by ELSE NULL END WHERE id = ?",
+    [done ? 1 : 0, done ? 1 : 0, done ? 1 : 0, done ? 1 : 0, cycleId]
+  );
+  const beneficiary = await beneficiaryLabel(cycleId);
+  await logAudit({
+    tontineId: await cycleTontineId(cycleId),
     actorUserId,
     action: "pot_verse",
     target: beneficiary,
-    amount: cyclePotAmount(cycleId),
+    amount: await cyclePotAmount(cycleId),
     method: null,
-    note: done ? `Tour n°${cycleIdx(cycleId)}` : `Tour n°${cycleIdx(cycleId)} — annulation`,
+    note: done ? `Tour n°${await cycleIdx(cycleId)}` : `Tour n°${await cycleIdx(cycleId)} — annulation`,
   });
 }
 
 /** Le bénéficiaire confirme avoir bien reçu le pot : le tour suivant s'ouvre. */
-export function confirmCycleReceipt(input: {
+export async function confirmCycleReceipt(input: {
   cycleId: string;
   actorUserId: string;
   actorMembershipId: string;
   byTreasurer?: boolean;
-}): ActionResult {
-  const c = db.prepare("SELECT * FROM cycles WHERE id = ?").get(input.cycleId) as
-    | CycleRow
-    | undefined;
+}): Promise<ActionResult> {
+  const c = await get<CycleRow>("SELECT * FROM cycles WHERE id = ?", [input.cycleId]);
   if (!c) return fail("Tour introuvable.");
   if (!c.payout_done) return fail("Le pot n'a pas encore été versé.");
   if (c.received_at) return fail("La réception du pot est déjà confirmée.");
 
-  db.prepare("UPDATE cycles SET received_at = datetime('now'), received_by = ? WHERE id = ?").run(
+  await run(`UPDATE cycles SET received_at = ${NOW}, received_by = ? WHERE id = ?`, [
     input.actorMembershipId,
-    c.id
-  );
-  logAudit({
+    c.id,
+  ]);
+  await logAudit({
     tontineId: c.tontine_id,
     actorUserId: input.actorUserId,
     action: "pot_recu",
-    target: beneficiaryLabel(c.id),
-    amount: cyclePotAmount(c.id),
+    target: await beneficiaryLabel(c.id),
+    amount: await cyclePotAmount(c.id),
     note:
       `Tour n°${c.idx}` + (input.byTreasurer ? " — confirmé par le trésorier (membre sans compte)" : ""),
   });
@@ -533,104 +536,102 @@ function fail(error: string): ActionResult {
 }
 
 /** Capital déjà versé par un membre (toutes cotisations confondues). */
-export function memberCapital(tontineId: string, membershipId: string): number {
-  const row = db
-    .prepare(
-      `SELECT COALESCE(SUM(c.amount), 0) AS total
-       FROM contributions c JOIN cycles cy ON cy.id = c.cycle_id
-       WHERE c.membership_id = ? AND cy.tontine_id = ?`
-    )
-    .get(membershipId, tontineId) as { total: number };
-  return row.total;
+export async function memberCapital(
+  tontineId: string,
+  membershipId: string
+): Promise<number> {
+  const row = await get<{ total: number }>(
+    `SELECT COALESCE(SUM(c.amount), 0) AS total
+     FROM contributions c JOIN cycles cy ON cy.id = c.cycle_id
+     WHERE c.membership_id = ? AND cy.tontine_id = ?`,
+    [membershipId, tontineId]
+  );
+  return row?.total ?? 0;
 }
 
-export function getAmountChanges(tontineId: string): {
+export async function getAmountChanges(tontineId: string): Promise<{
   old_amount: number;
   new_amount: number;
   from_cycle: number;
   created_at: string;
-}[] {
-  return db
-    .prepare(
-      "SELECT old_amount, new_amount, from_cycle, created_at FROM amount_changes WHERE tontine_id = ? ORDER BY created_at DESC"
-    )
-    .all(tontineId) as {
-    old_amount: number;
-    new_amount: number;
-    from_cycle: number;
-    created_at: string;
-  }[];
+}[]> {
+  return all(
+    "SELECT old_amount, new_amount, from_cycle, created_at FROM amount_changes WHERE tontine_id = ? ORDER BY created_at DESC",
+    [tontineId]
+  );
 }
 
 /** Réaffecte les tours à venir aux membres actifs et supprime les tours de trop. */
-function reassignFutureCycles(t: TontineRow): void {
-  const active = getActiveMembers(t.id);
-  const cycles = getCycles(t.id);
+async function reassignFutureCycles(t: TontineRow): Promise<void> {
+  const active = await getActiveMembers(t.id);
+  const cycles = await getCycles(t.id);
   const cur = currentCycle(cycles);
   const fromIdx = cur ? cur.idx + 1 : 1;
 
-  db.prepare(
+  await run(
     `DELETE FROM cycles WHERE tontine_id = ? AND idx > ? AND payout_done = 0
-       AND NOT EXISTS (SELECT 1 FROM contributions c WHERE c.cycle_id = cycles.id)`
-  ).run(t.id, active.length);
-
-  const update = db.prepare(
-    "UPDATE cycles SET beneficiary_id = ? WHERE tontine_id = ? AND idx = ?"
+       AND NOT EXISTS (SELECT 1 FROM contributions c WHERE c.cycle_id = cycles.id)`,
+    [t.id, active.length]
   );
+
   for (const c of cycles) {
     if (c.idx >= fromIdx && c.idx <= active.length && !c.payout_done) {
       const beneficiary = active[c.idx - 1];
-      if (beneficiary) update.run(beneficiary.id, t.id, c.idx);
+      if (beneficiary)
+        await run("UPDATE cycles SET beneficiary_id = ? WHERE tontine_id = ? AND idx = ?", [
+          beneficiary.id,
+          t.id,
+          c.idx,
+        ]);
     }
   }
 }
 
 /** Un membre quitte la tontine : on le marque « parti », on ouvre son remboursement et on réaffecte les tours. */
-export function leaveMember(
+export async function leaveMember(
   tontineId: string,
   membershipId: string,
   actorUserId: string
-): ActionResult {
-  const t = getTontine(tontineId);
+): Promise<ActionResult> {
+  const t = await getTontine(tontineId);
   if (!t) return fail("Tontine introuvable.");
   if (t.status !== "actif") return fail("Tontine clôturée : plus de départ possible.");
 
-  const m = db
-    .prepare("SELECT * FROM memberships WHERE id = ? AND tontine_id = ?")
-    .get(membershipId, tontineId) as MembershipRow | undefined;
+  const m = await get<MembershipRow>("SELECT * FROM memberships WHERE id = ? AND tontine_id = ?", [
+    membershipId,
+    tontineId,
+  ]);
   if (!m) return fail("Membre introuvable.");
   if (m.status !== "parti" && m.status !== "actif") return fail("Membre introuvable.");
   if (m.status !== "actif") return fail("Ce membre a déjà quitté la tontine.");
   if (m.is_treasurer)
     return fail("Le trésorier ne peut pas quitter la tontine : transmettez d'abord ce rôle.");
 
-  const cycles = ensureCycles(t);
+  const cycles = await ensureCycles(t);
   const cur = currentCycle(cycles);
   if (cur && cur.beneficiary_id === m.id)
     return fail("Ce membre est le bénéficiaire du tour en cours : attendez la fin du tour.");
 
-  const received = db
-    .prepare(
-      "SELECT 1 AS x FROM cycles WHERE tontine_id = ? AND beneficiary_id = ? AND payout_done = 1"
-    )
-    .get(tontineId, m.id);
+  const received = await get<{ x: number }>(
+    "SELECT 1 AS x FROM cycles WHERE tontine_id = ? AND beneficiary_id = ? AND payout_done = 1",
+    [tontineId, m.id]
+  );
   if (received)
     return fail("Ce membre a déjà reçu le pot : son départ laisserait la caisse en déficit.");
 
-  const capital = memberCapital(tontineId, m.id);
+  const capital = await memberCapital(tontineId, m.id);
 
-  db.transaction(() => {
-    db.prepare(
-      "UPDATE memberships SET status = 'parti', left_at = datetime('now') WHERE id = ?"
-    ).run(m.id);
+  await tx(async () => {
+    await run("UPDATE memberships SET status = 'parti', left_at = " + NOW + " WHERE id = ?", [m.id]);
     if (capital > 0) {
-      db.prepare(
+      await run(
         `INSERT INTO refunds (id, tontine_id, membership_id, amount)
-         VALUES (?, ?, ?, ?) ON CONFLICT(tontine_id, membership_id) DO NOTHING`
-      ).run(newId(), tontineId, m.id, capital);
+         VALUES (?, ?, ?, ?) ON CONFLICT(tontine_id, membership_id) DO NOTHING`,
+        [newId(), tontineId, m.id, capital]
+      );
     }
-    reassignFutureCycles(t);
-    logAudit({
+    await reassignFutureCycles(t);
+    await logAudit({
       tontineId,
       actorUserId,
       action: "membre_parti",
@@ -638,7 +639,7 @@ export function leaveMember(
       amount: capital > 0 ? capital : null,
       note: capital > 0 ? "Remboursement à régler" : "Aucune cotisation versée",
     });
-  })();
+  });
 
   return {
     ok: true,
@@ -650,12 +651,12 @@ export function leaveMember(
 }
 
 /** La cotisation change à partir du tour suivant (le tour en cours garde son montant). */
-export function changeAmount(
+export async function changeAmount(
   tontineId: string,
   newAmount: number,
   userId: string
-): ActionResult {
-  const t = getTontine(tontineId);
+): Promise<ActionResult> {
+  const t = await getTontine(tontineId);
   if (!t) return fail("Tontine introuvable.");
   if (t.status !== "actif") return fail("Tontine clôturée : montant figé.");
   if (!Number.isFinite(newAmount) || newAmount < 500)
@@ -663,23 +664,24 @@ export function changeAmount(
   const rounded = Math.round(newAmount);
   if (rounded === t.amount) return fail(`Le montant est déjà à ${formatFcfa(rounded)}.`);
 
-  const cycles = ensureCycles(t);
+  const cycles = await ensureCycles(t);
   const cur = currentCycle(cycles);
   const fromIdx = cur ? cur.idx + 1 : 1;
   const old = t.amount;
 
-  db.transaction(() => {
-    db.prepare("UPDATE tontines SET amount = ? WHERE id = ?").run(rounded, tontineId);
-    db.prepare("UPDATE cycles SET amount = ? WHERE tontine_id = ? AND idx >= ?").run(
+  await tx(async () => {
+    await run("UPDATE tontines SET amount = ? WHERE id = ?", [rounded, tontineId]);
+    await run("UPDATE cycles SET amount = ? WHERE tontine_id = ? AND idx >= ?", [
       rounded,
       tontineId,
-      fromIdx
-    );
-    db.prepare(
+      fromIdx,
+    ]);
+    await run(
       `INSERT INTO amount_changes (id, tontine_id, old_amount, new_amount, from_cycle, created_by)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(newId(), tontineId, old, rounded, fromIdx, userId);
-    logAudit({
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [newId(), tontineId, old, rounded, fromIdx, userId]
+    );
+    await logAudit({
       tontineId,
       actorUserId: userId,
       action: "montant_change",
@@ -687,7 +689,7 @@ export function changeAmount(
       amount: rounded,
       note: `À partir du tour n°${fromIdx}`,
     });
-  })();
+  });
 
   return {
     ok: true,
@@ -696,14 +698,17 @@ export function changeAmount(
 }
 
 /** Clôture définitive de la tontine (les tours restants sont annulés). */
-export function closeTontine(tontineId: string, actorUserId: string): ActionResult {
-  const t = getTontine(tontineId);
+export async function closeTontine(
+  tontineId: string,
+  actorUserId: string
+): Promise<ActionResult> {
+  const t = await getTontine(tontineId);
   if (!t) return fail("Tontine introuvable.");
   if (t.status !== "actif") return fail("Cette tontine est déjà clôturée.");
-  db.prepare("UPDATE tontines SET status = 'cloturee', closed_at = datetime('now') WHERE id = ?").run(
-    tontineId
-  );
-  logAudit({
+  await run(`UPDATE tontines SET status = 'cloturee', closed_at = ${NOW} WHERE id = ?`, [
+    tontineId,
+  ]);
+  await logAudit({
     tontineId,
     actorUserId,
     action: "tontine_cloturee",
@@ -714,36 +719,31 @@ export function closeTontine(tontineId: string, actorUserId: string): ActionResu
 }
 
 /** Enregistre le remboursement effectué d'un membre parti. */
-export function markRefundPaid(input: {
+export async function markRefundPaid(input: {
   refundId: string;
   tontineId: string;
   amount: number;
   method: string;
   note?: string;
   paidBy: string;
-}): ActionResult {
-  const r = db
-    .prepare("SELECT * FROM refunds WHERE id = ? AND tontine_id = ?")
-    .get(input.refundId, input.tontineId) as RefundRow | undefined;
+}): Promise<ActionResult> {
+  const r = await get<RefundRow>("SELECT * FROM refunds WHERE id = ? AND tontine_id = ?", [
+    input.refundId,
+    input.tontineId,
+  ]);
   if (!r) return fail("Remboursement introuvable.");
   if (r.status === "paye") return fail("Ce remboursement est déjà réglé.");
-  if (!Number.isFinite(input.amount) || input.amount < 0)
-    return fail("Montant invalide.");
+  if (!Number.isFinite(input.amount) || input.amount < 0) return fail("Montant invalide.");
 
-  db.prepare(
+  await run(
     `UPDATE refunds SET status = 'paye', paid_amount = ?, method = ?, note = ?,
-       paid_at = datetime('now'), paid_by = ? WHERE id = ?`
-  ).run(
-    Math.round(input.amount),
-    input.method,
-    input.note?.trim() || null,
-    input.paidBy,
-    input.refundId
+       paid_at = ${NOW}, paid_by = ? WHERE id = ?`,
+    [Math.round(input.amount), input.method, input.note?.trim() || null, input.paidBy, input.refundId]
   );
-  const member = db
-    .prepare("SELECT name FROM memberships WHERE id = ?")
-    .get(r.membership_id) as { name: string } | undefined;
-  logAudit({
+  const member = await get<{ name: string }>("SELECT name FROM memberships WHERE id = ?", [
+    r.membership_id,
+  ]);
+  await logAudit({
     tontineId: input.tontineId,
     actorUserId: input.paidBy,
     action: "remboursement_regle",
@@ -756,23 +756,25 @@ export function markRefundPaid(input: {
 }
 
 /** Annule un remboursement marqué par erreur. */
-export function unmarkRefundPaid(
+export async function unmarkRefundPaid(
   refundId: string,
   tontineId: string,
   actorUserId: string
-): ActionResult {
-  const r = db
-    .prepare("SELECT * FROM refunds WHERE id = ? AND tontine_id = ?")
-    .get(refundId, tontineId) as RefundRow | undefined;
+): Promise<ActionResult> {
+  const r = await get<RefundRow>("SELECT * FROM refunds WHERE id = ? AND tontine_id = ?", [
+    refundId,
+    tontineId,
+  ]);
   if (!r) return fail("Remboursement introuvable.");
   if (r.status !== "paye") return fail("Ce remboursement n'est pas réglé.");
-  db.prepare(
-    "UPDATE refunds SET status = 'attente', paid_amount = NULL, method = NULL, paid_at = NULL, paid_by = NULL WHERE id = ?"
-  ).run(refundId);
-  const member = db
-    .prepare("SELECT name FROM memberships WHERE id = ?")
-    .get(r.membership_id) as { name: string } | undefined;
-  logAudit({
+  await run(
+    "UPDATE refunds SET status = 'attente', paid_amount = NULL, method = NULL, paid_at = NULL, paid_by = NULL WHERE id = ?",
+    [refundId]
+  );
+  const member = await get<{ name: string }>("SELECT name FROM memberships WHERE id = ?", [
+    r.membership_id,
+  ]);
+  await logAudit({
     tontineId,
     actorUserId,
     action: "remboursement_annule",
