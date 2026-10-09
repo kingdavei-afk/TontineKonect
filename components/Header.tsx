@@ -37,6 +37,14 @@ export async function Header() {
               >
                 Mes tontines
               </Link>
+              <Link
+                href="/guide-tontinekonect.pdf"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded-lg px-3 py-2 text-sm font-semibold text-stone-700 transition hover:bg-stone-100"
+              >
+                Guide TontineKonect
+              </Link>
               <PushToggle publicKey={getVapidPublicKey()} />
               <span className="hidden text-sm text-stone-500 sm:inline">{user.name}</span>
               <form action={logout}>
