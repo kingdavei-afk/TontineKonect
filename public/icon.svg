@@ -1,7 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="112" fill="#ea580c"/>
-  <circle cx="256" cy="236" r="120" fill="none" stroke="#ffffff" stroke-width="26"/>
-  <circle cx="256" cy="236" r="66" fill="#ffffff"/>
-  <path d="M176 392h168M176 432h112" stroke="#ffffff" stroke-width="26" stroke-linecap="round"/>
-  <path d="M256 96v40M356 136l-28 28M156 136l28 28" stroke="#fdba74" stroke-width="22" stroke-linecap="round"/>
+  <title>Tontine Konect — Le Cercle</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f97316"/>
+      <stop offset="1" stop-color="#ea580c"/>
+    </linearGradient>
+  </defs>
+  <!-- Tuile -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- Cercle ouvert : la tontine, incomplète tant qu'un membre n'a pas rejoint -->
+  <path d="M321.7 132.4 A140 140 0 1 1 190.3 132.4"
+        fill="none" stroke="#ffffff" stroke-width="44" stroke-linecap="round"/>
+  <!-- Le membre / la pièce qui vient se connecter et refermer le cercle -->
+  <circle cx="256" cy="116" r="34" fill="#fdba74"/>
 </svg>

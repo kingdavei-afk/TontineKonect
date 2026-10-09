@@ -11,9 +11,18 @@ export async function Header() {
     <header className="sticky top-0 z-20 border-b border-stone-200 bg-white/90 backdrop-blur">
       <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3 sm:px-6">
         <Link href={user ? "/tontines" : "/"} className="flex items-center gap-2">
-          <span className="grid h-8 w-8 place-items-center rounded-lg bg-orange-600 text-sm font-bold text-white">
-            TK
-          </span>
+          <svg className="h-8 w-8 shrink-0 rounded-lg bg-orange-100" width="48" height="48" viewBox="0 0 512 512" role="img" aria-label="Tontine Konect — Le Cercle">
+            <title>Tontine Konect — Le Cercle</title>
+            <defs>
+              <linearGradient id="h-bg" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#f97316"/>
+                <stop offset="1" stop-color="#ea580c"/>
+              </linearGradient>
+            </defs>
+            <rect width="512" height="512" rx="112" fill="url(#h-bg)"/>
+            <path d="M321.7 132.4 A140 140 0 1 1 190.3 132.4" fill="none" stroke="#ffffff" stroke-width="44" stroke-linecap="round"/>
+            <circle cx="256" cy="116" r="34" fill="#fdba74"/>
+          </svg>
           <span className="text-lg font-extrabold tracking-tight text-stone-900">
             Tontine <span className="text-orange-600">Konect</span>
           </span>
